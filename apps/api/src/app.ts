@@ -11,12 +11,16 @@ import type {
   SandboxProvider,
   TransactionalEmailProvider,
 } from "@rakazo/adapter-kit";
+import type {
+  ComposioProvider,
+  ConnectorRegistry,
+  DestinationEmulator,
+  RemoteConnectorDependencies,
+} from "@rakazo/adapters";
 import {
   applyMessagingOutboundStatus,
   ChatSdkMessagingSurface,
   ComposioConnector,
-  type ComposioProvider,
-  type ConnectorRegistry,
   createBackgroundJobHandlers,
   createCloudAgentConnection,
   createConnectorStack,
@@ -27,7 +31,6 @@ import {
   createRunSandbox,
   createRunSecretWriter,
   createWebProvider,
-  type DestinationEmulator,
   destroyBot,
   EmailEmulator,
   EncryptedSecretStore,
@@ -52,7 +55,6 @@ import {
   pipedreamConfigFromEnv,
   piSessionsRoot,
   pushTokenPath,
-  type RemoteConnectorDependencies,
   reconcileCloudAgents,
   reconcileComputerUpdates,
   removePiUserSessions,
@@ -72,19 +74,20 @@ import {
   provisionMessagingIdentity,
   requireMembership,
 } from "@rakazo/db";
+import type { Logger } from "@rakazo/logging";
 import {
   createServiceLogger,
   enrichLogContext,
   getLogger,
   installLogger,
-  type Logger,
   SERVICE_NAMES,
 } from "@rakazo/logging";
 import { requestLogging } from "@rakazo/logging/hono";
 import { MarkdownMemoryStore } from "@rakazo/memory";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { type AppEnv, loadEnv } from "./env.js";
+import type { AppEnv } from "./env.js";
+import { loadEnv } from "./env.js";
 import { mountLocalSettings } from "./local-settings.js";
 import {
   createMessagingInboundHandler,
@@ -421,6 +424,7 @@ export async function createApp(
   reconciler?.start();
 
   const router = createRouter({
+    cloudAgent,
     prisma,
     events,
     auth,
@@ -447,8 +451,11 @@ export async function createApp(
       agentRuntime: env.agentRuntime,
       defaultProvider: env.defaultProvider,
       defaultModel: env.defaultModel,
+      teamChatJudgeProvider: env.teamChatJudgeProvider,
+      teamChatJudgeModel: env.teamChatJudgeModel,
       deploymentModelKey: env.deploymentModelKey,
       webOrigin: env.webOrigin,
+      privacyPolicyUrl: env.privacyPolicyUrl,
       screenProxySecret: env.screenProxySecret,
       sandboxProvider: env.sandboxProvider,
       gitSha: env.gitSha,

@@ -1,31 +1,40 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { implement, ORPCError } from "@orpc/server";
+import type {
+  AdapterContext,
+  AgentHomeStore,
+  ArtifactStore,
+  ConnectorCatalogItem,
+  JobPublisher,
+  MemoryStore,
+  SandboxProvider,
+} from "@rakazo/adapter-kit";
 import {
-  type AdapterContext,
-  type AgentHomeStore,
-  type ArtifactStore,
-  type ConnectorCatalogItem,
   computerControlExpireJobKey,
-  type JobPublisher,
-  type MemoryStore,
   messagingDeliverJob,
   routineJobKey,
   routineWakeupJob,
   runContinueJob,
   runJobKey,
-  type SandboxProvider,
 } from "@rakazo/adapter-kit";
-import type { IntegrationProviderSettings } from "@rakazo/adapters";
+import type {
+  CloudAgentConnection,
+  ComposioProvider,
+  ComputerExecutionLease,
+  ConnectorRegistry,
+  EncryptedSecretStore,
+  IntegrationProviderSettings,
+  MemoryProviderResolver,
+  PiOAuthLogins,
+  RemoteConnectorDependencies,
+} from "@rakazo/adapters";
 import {
   acquireComputerExecutionLease,
   applyTeachingDesktopInput,
   archiveBot,
   buildMcpCredentialBlob,
   buildModelConnectPlaintext,
-  type ComposioProvider,
   ComputerBusyError,
-  type ComputerExecutionLease,
-  type ConnectorRegistry,
   cancelComputerRunWork,
   checkpointAndRecordComputerWorkspace,
   clearInactiveUserComputerControl,
@@ -36,7 +45,6 @@ import {
   deploymentAutoReviewDefault,
   destroyBot,
   displayBotWorkspacePath,
-  type EncryptedSecretStore,
   enqueueTakeoverContinuation,
   expireComputerControl,
   hasActiveComputerControl,
@@ -47,17 +55,14 @@ import {
   listPiCatalog,
   listScratchpadItems,
   McpOAuthBroker,
-  type MemoryProviderResolver,
   mapScratchpadItem,
   modelCredentialDto,
-  type PiOAuthLogins,
   planLiveConnectionSync,
   prepareApiInstall,
   prepareGraphqlInstall,
   probeOpenAiCompatibleModels,
   provisionComputer,
   queueComputerUpdate,
-  type RemoteConnectorDependencies,
   releaseComputerExecutionLease,
   replaceComputer,
   resolveAutoReviewChecker,
@@ -75,15 +80,11 @@ import {
   verifyMcpInstall,
 } from "@rakazo/adapters";
 import type { Auth } from "@rakazo/auth";
+import type { Actor, ComputerStatus, McpServer, Me, SpaceNavigation } from "@rakazo/contracts";
 import {
-  type Actor,
   appContract,
-  type ComputerStatus,
   IntegrationProviderIdSchema,
-  type McpServer,
-  type Me,
   OPENAI_COMPATIBLE_PROVIDER_ID,
-  type SpaceNavigation,
 } from "@rakazo/contracts";
 import {
   ACTIVE_RUN_STATUSES,
@@ -94,6 +95,7 @@ import {
   isOneShotRoutineCrons,
   nextCronDateAcrossStrict,
 } from "@rakazo/core";
+import type { PrismaClient, ThreadEvents } from "@rakazo/db";
 import {
   appendEventInTransaction,
   CannotDeleteDefaultSpaceError,
@@ -119,7 +121,6 @@ import {
   newestModelCredentialOrder,
   newestVoiceCredentialOrder,
   Prisma,
-  type PrismaClient,
   parseComputerMode,
   releaseSpaceDeletionClaim,
   renewSpaceDeletionClaim,
@@ -130,12 +131,12 @@ import {
   SpaceNotFoundError,
   selectSpaceModelPreference,
   selectSpaceVoicePreference,
-  type ThreadEvents,
   touchGroupUpdatedAt,
 } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
 import { deleteAgentSecret, listAgentSecrets, putAgentSecret } from "./agent-secrets.js";
 import { createAgentSkillsService } from "./agent-skills.js";
+import { aiConsentStatus, allowAiConsent } from "./ai-consent.js";
 import { createOwnedArtifact, getOwnedArtifact, getSpaceArtifact } from "./artifacts.js";
 import { botProfileLabelsChanged, commitBotUpdate } from "./bot-update.js";
 import {
@@ -162,11 +163,11 @@ import { listSpaceRuns } from "./runs.js";
 import { addScreenProxyCapability } from "./screen-proxy.js";
 import { querySpaceSearch } from "./search.js";
 import { withSerializableRetry } from "./serializable-retry.js";
+import type { UpdaterProxyConfig } from "./server-update.js";
 import {
   applyServerUpdate,
   checkServerUpdate,
   readServerUpdateStatus,
-  type UpdaterProxyConfig,
   UpdaterProxyError,
 } from "./server-update.js";
 import { assertTeachingSendAllowed, createTaughtSkillsService } from "./taught-skills.js";
@@ -413,6 +414,7 @@ function mcpAssignmentDto(row: {
 }
 
 export interface RouterDeps {
+  cloudAgent?: CloudAgentConnection | null;
   prisma: PrismaClient;
   events: ThreadEvents;
   auth: Auth;
@@ -434,10 +436,13 @@ export interface RouterDeps {
   messaging?: { enabled: boolean; providers: string[]; openSignup: boolean };
   env: {
     agentRuntime: string;
+    teamChatJudgeProvider?: string;
+    teamChatJudgeModel?: string;
     defaultProvider: string;
     defaultModel: string;
     deploymentModelKey?: string;
     webOrigin: string;
+    privacyPolicyUrl?: string;
     screenProxySecret: string;
     sandboxProvider: string;
     gitSha?: string;
@@ -488,6 +493,24 @@ export function createRouter(deps: RouterDeps) {
   });
 
   return os.router({
+    aiConsent: {
+      status: authed.aiConsent.status.handler(({ context, input }) =>
+        aiConsentStatus(deps, context.actor, input),
+      ),
+      allow: authed.aiConsent.allow.handler(({ context, input }) =>
+        allowAiConsent(deps, context.actor, input),
+      ),
+      revoke: authed.aiConsent.revoke.handler(async ({ context, input }) => {
+        await deps.prisma.aiDataConsent.deleteMany({
+          where: {
+            userId: context.actor.userId,
+            spaceId: context.actor.spaceId,
+            recipientKey: input.key ?? undefined,
+          },
+        });
+        return aiConsentStatus(deps, context.actor);
+      }),
+    },
     health: os.health.handler(async () => ({ ok: true as const, version: "0.1.0" })),
     me: authed.me.handler(async ({ context }): Promise<Me> => meDto(deps, context.actor)),
     preferences: {
