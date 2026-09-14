@@ -98,6 +98,7 @@ import {
 import type { PrismaClient, ThreadEvents } from "@rakazo/db";
 import {
   appendEventInTransaction,
+  BotSectionNameConflictError,
   CannotDeleteDefaultSpaceError,
   CannotDeleteLastSpaceError,
   CannotDeleteSpaceAsNonOwnerError,
@@ -1372,6 +1373,16 @@ export function createRouter(deps: RouterDeps) {
       create: authed.botSections.create.handler(async ({ context, input }) =>
         repos.createBotSection(context.actor, input),
       ),
+      update: authed.botSections.update.handler(async ({ context, input }) => {
+        try {
+          return await repos.updateBotSection(context.actor, input);
+        } catch (error) {
+          if (error instanceof BotSectionNameConflictError) {
+            throw new ORPCError("CONFLICT", { message: error.message });
+          }
+          throw error;
+        }
+      }),
     },
     threads: {
       head: authed.threads.head.handler(async ({ context, input }) => {
