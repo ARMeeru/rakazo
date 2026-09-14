@@ -63,10 +63,12 @@ import {
 } from "@rakazo/adapters";
 import { blockedAuthPaths, createAuth } from "@rakazo/auth";
 import { signupPolicyFromEnv } from "@rakazo/core";
+import type { Pool, PrismaClient } from "@rakazo/db";
 import {
   createDb,
+  createPool,
   createThreadEvents,
-  type PrismaClient,
+  parsePositiveInteger,
   provisionMessagingIdentity,
   requireMembership,
 } from "@rakazo/db";
@@ -149,9 +151,11 @@ export async function createApp(
   installLogger(logger);
   const created = prismaOverride
     ? { prisma: prismaOverride, pool: undefined }
-    : createDb(env.databaseUrl);
+    : createDb(env.databaseUrl, {
+        poolMax: parsePositiveInteger(process.env.DB_POOL_MAX, 4),
+        applicationName: "rakazo-api",
+      });
   const { prisma } = created;
-  created.pool?.on("error", () => undefined);
   const realtime =
     realtimeOverride ??
     (created.pool
@@ -191,7 +195,25 @@ export async function createApp(
 
   const jobKind = env.wakeupDriver;
   const inMemoryJobs = jobKind === "memory" ? new InMemoryJobQueue() : undefined;
-  const jobs = inMemoryJobs ?? new GraphileJobPublisher(env.databaseUrl);
+  // prismaOverride skips createDb, so there is no shared pool. The previous
+  // GraphileJobPublisher(databaseUrl) path opened its own connections; keep a
+  // bounded pool for that override path instead of passing undefined.
+  let ownedJobPool: Pool | undefined;
+  if (!inMemoryJobs && !created.pool) {
+    ownedJobPool = createPool(env.databaseUrl, {
+      poolMax: parsePositiveInteger(process.env.DB_POOL_MAX, 4),
+      applicationName: "rakazo-api-jobs",
+    });
+  }
+  const jobPool = created.pool ?? ownedJobPool;
+  const jobs = inMemoryJobs
+    ? inMemoryJobs
+    : new GraphileJobPublisher(
+        jobPool ??
+          (() => {
+            throw new Error("Graphile job publisher requires a PostgreSQL pool");
+          })(),
+      );
   const sandbox: SandboxProvider =
     sandboxOverride ??
     createRunSandbox(env.sandboxProvider, {
@@ -826,6 +848,7 @@ export async function createApp(
       await mcp.close();
       await prisma.$disconnect().catch(() => undefined);
       await created.pool?.end().catch(() => undefined);
+      await ownedJobPool?.end().catch(() => undefined);
       await logger.flush({ timeoutMs: 2_000 });
     },
   };
