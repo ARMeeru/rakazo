@@ -76,6 +76,7 @@ import {
   Popover,
   PopoverContent,
   PopoverTrigger,
+  resolvePersonaColorDef,
 } from "@rakazo/ui-web";
 import {
   ArrowDown,
@@ -86,6 +87,7 @@ import {
   Clock,
   Copy,
   Gauge,
+  LayoutGrid,
   Lock,
   LogOut,
   Maximize2,
@@ -96,6 +98,7 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Paperclip,
+  Pencil,
   Plus,
   Puzzle,
   Reply,
@@ -153,6 +156,7 @@ import {
   shouldNotifyBrowser,
 } from "../lib/browser-notifications";
 import { loadComputerScreen } from "../lib/computer-screen";
+import { desktopBridge } from "../lib/desktop";
 import { scheduleFocusPrompt } from "../lib/focus-prompt";
 import { localTimezone } from "../lib/local-timezone";
 import { copyableMessageText } from "../lib/message-text";
@@ -214,6 +218,7 @@ import {
   NewBotSectionDialog,
   NewSpaceDialog,
   PickerInfoDialog,
+  RenameBotSectionDialog,
 } from "./shell/dialogs";
 import {
   AppConnectCard,
@@ -275,6 +280,8 @@ const FALLBACK_BOT_COLOR = "#85858A";
 const THREAD_SNAPSHOT_TIMEOUT_MS = 2_000;
 /** Bound Settings leave so a hung voice status refresh cannot block dismissal. */
 const VOICE_STATUS_REFRESH_TIMEOUT_MS = 10_000;
+const MOBILE_SIDEBAR_SWIPE_EDGE_PX = 32;
+const MOBILE_SIDEBAR_SWIPE_DISTANCE_PX = 56;
 
 function threadSnapshotSignal(parent: AbortSignal): AbortSignal {
   return AbortSignal.any([parent, AbortSignal.timeout(THREAD_SNAPSHOT_TIMEOUT_MS)]);
@@ -438,6 +445,7 @@ export function ShellPage() {
     useState<ReadonlySet<string>>(readSeenRunErrorIds);
   const [menuOpen, setMenuOpen] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const mobileSidebarSwipeRef = useRef<{ startX: number; startY: number } | null>(null);
   const [draggedBotId, setDraggedBotId] = useState<string | null>(null);
   const [createMenuOpen, setCreateMenuOpen] = useState(false);
   const [botsSidebarCollapsed, setBotsSidebarCollapsed] = useState(false);
@@ -499,6 +507,22 @@ export function ShellPage() {
   const [newSectionTarget, setNewSectionTarget] = useState<
     { kind: "bot"; chat: Bot } | { kind: "group"; chat: Group } | null
   >(null);
+  const [renameSectionTarget, setRenameSectionTarget] = useState<{
+    section: BotSection;
+    spaceId: string;
+  } | null>(null);
+  const [sectionMenu, setSectionMenu] = useState<{
+    section: BotSection;
+    spaceId: string;
+    position: ContextMenuPosition;
+  } | null>(null);
+  const sectionMenuAnchor = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    if (sectionMenu || !sectionMenuAnchor.current) return;
+    sectionMenuAnchor.current.focus();
+    sectionMenuAnchor.current = null;
+  }, [sectionMenu]);
+  const closeSectionMenu = useCallback(() => setSectionMenu(null), []);
   const [booting, setBooting] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [initialBotsLoaded, setInitialBotsLoaded] = useState(false);
@@ -512,10 +536,32 @@ export function ShellPage() {
   const [routineError, setRoutineError] = useState<string | null>(null);
   const [screenUrl, setScreenUrl] = useState<string | null>(null);
   const [computerOpen, setComputerOpen] = useState(false);
+  const [computerViewport, setComputerViewport] = useState<{
+    height: number;
+    offsetTop: number;
+  } | null>(null);
   const [computerError, setComputerError] = useState<string | null>(null);
   // Screen-load failures can sit beside a still-valid embed URL; boot and
   // takeover failures must stay visible even when a URL remains.
   const [computerErrorFromScreen, setComputerErrorFromScreen] = useState(false);
+  useEffect(() => {
+    if (!computerOpen) {
+      setComputerViewport(null);
+      return;
+    }
+    const viewport = window.visualViewport;
+    if (!viewport) return;
+    const sync = () => {
+      setComputerViewport({ height: viewport.height, offsetTop: viewport.offsetTop });
+    };
+    sync();
+    viewport.addEventListener("resize", sync);
+    viewport.addEventListener("scroll", sync);
+    return () => {
+      viewport.removeEventListener("resize", sync);
+      viewport.removeEventListener("scroll", sync);
+    };
+  }, [computerOpen]);
   useEffect(() => {
     if (!session.data?.user) return;
     let cancelled = false;
@@ -1319,6 +1365,7 @@ export function ShellPage() {
         space.botSections,
       ).map((group, index) => ({
         ...group,
+        sectionId: group.key.startsWith("section:") ? group.key.slice("section:".length) : null,
         key: showSpaceNames ? `space:${space.id}:${group.key}` : group.key,
         title: showSpaceNames
           ? group.title
@@ -1340,6 +1387,7 @@ export function ShellPage() {
           key: `space:${space.id}:empty`,
           title: space.name,
           bots: [],
+          sectionId: null,
           showLock: true,
           emptySpaceId: space.id,
           spaceId: space.id,
@@ -2419,6 +2467,47 @@ export function ShellPage() {
       data-testid="shell-root"
       data-ready={shellReady}
       className="relative flex h-full min-w-0 overflow-hidden bg-background text-foreground/90"
+      onTouchStartCapture={(event) => {
+        if (
+          mobileSidebarOpen ||
+          event.touches.length !== 1 ||
+          window.matchMedia("(min-width: 768px)").matches
+        ) {
+          mobileSidebarSwipeRef.current = null;
+          return;
+        }
+        const touch = event.touches[0];
+        if (!touch) return;
+        const rtl = document.documentElement.getAttribute("dir") === "rtl";
+        const startsAtEdge = rtl
+          ? touch.clientX >= window.innerWidth - MOBILE_SIDEBAR_SWIPE_EDGE_PX
+          : touch.clientX <= MOBILE_SIDEBAR_SWIPE_EDGE_PX;
+        mobileSidebarSwipeRef.current = startsAtEdge
+          ? { startX: touch.clientX, startY: touch.clientY }
+          : null;
+      }}
+      onTouchEndCapture={(event) => {
+        const swipe = mobileSidebarSwipeRef.current;
+        mobileSidebarSwipeRef.current = null;
+        const touch = event.changedTouches[0];
+        if (
+          !swipe ||
+          !touch ||
+          mobileSidebarOpen ||
+          window.matchMedia("(min-width: 768px)").matches
+        ) {
+          return;
+        }
+        const rtl = document.documentElement.getAttribute("dir") === "rtl";
+        const horizontal = rtl ? swipe.startX - touch.clientX : touch.clientX - swipe.startX;
+        const vertical = Math.abs(touch.clientY - swipe.startY);
+        if (horizontal >= MOBILE_SIDEBAR_SWIPE_DISTANCE_PX && horizontal > vertical * 1.25) {
+          setMobileSidebarOpen(true);
+        }
+      }}
+      onTouchCancelCapture={() => {
+        mobileSidebarSwipeRef.current = null;
+      }}
     >
       <ComputerUpdateProgress
         onCompleted={() => {
@@ -2434,6 +2523,13 @@ export function ShellPage() {
           aria-label={t`Close navigation`}
           onClick={() => setMobileSidebarOpen(false)}
           className="absolute inset-y-0 end-0 start-[min(calc(100%-48px),316px)] z-30 bg-overlay md:hidden"
+        />
+      ) : null}
+      {!mobileSidebarOpen ? (
+        <div
+          data-testid="mobile-sidebar-swipe-edge"
+          aria-hidden="true"
+          className="absolute bottom-20 start-0 top-16 z-20 w-8 touch-none md:hidden"
         />
       ) : null}
       <aside
@@ -2535,7 +2631,7 @@ export function ShellPage() {
         </div>
         <InputGroup
           data-testid="sidebar-search"
-          className="mx-2.5 mb-3 w-auto rounded-xl bg-card dark:bg-input"
+          className="mx-2.5 mb-3 w-auto rounded-xl bg-card dark:bg-input border border-border text-muted-foreground focus-within:border-ring"
         >
           <InputGroupAddon>
             <Search size={16} strokeWidth={1.8} aria-hidden="true" />
@@ -2574,10 +2670,10 @@ export function ShellPage() {
                 return (
                   <div key={group.key} data-sidebar-group={group.key}>
                     {group.title ? (
-                      <div className="flex items-center pt-2">
+                      <div className="flex items-center pt-3 pb-0.5">
                         <button
                           type="button"
-                          className="flex min-w-0 flex-1 items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 text-[12.5px] font-medium text-muted-foreground/80 hover:bg-sidebar-accent focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring"
+                          className="flex min-w-0 flex-1 items-center justify-between gap-2 rounded-lg px-2.5 py-1 text-[11px] font-semibold tracking-wider uppercase text-muted-foreground/60 hover:text-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring"
                           onClick={() => {
                             if (group.emptySpaceId) {
                               openSpaceChat(group.emptySpaceId, "/onboarding");
@@ -2586,16 +2682,37 @@ export function ShellPage() {
                             toggleSidebarSection(group.key);
                           }}
                           onContextMenu={
-                            group.canDeleteSpace
+                            group.sectionId
                               ? (event) => {
                                   event.preventDefault();
-                                  spaceMenuAnchor.current = event.currentTarget;
-                                  setSpaceMenu({
-                                    id: group.spaceId,
+                                  // Prefer section rename over delete-space when both apply;
+                                  // the dedicated space-actions button still opens the space menu.
+                                  const sections =
+                                    group.spaceId === bootstrapMe?.spaceId
+                                      ? botSections
+                                      : (spaces.find((space) => space.id === group.spaceId)
+                                          ?.botSections ?? []);
+                                  const section = sections.find(
+                                    (item) => item.id === group.sectionId,
+                                  );
+                                  if (!section) return;
+                                  sectionMenuAnchor.current = event.currentTarget;
+                                  setSectionMenu({
+                                    section,
+                                    spaceId: group.spaceId,
                                     position: { x: event.clientX, y: event.clientY },
                                   });
                                 }
-                              : undefined
+                              : group.canDeleteSpace
+                                ? (event) => {
+                                    event.preventDefault();
+                                    spaceMenuAnchor.current = event.currentTarget;
+                                    setSpaceMenu({
+                                      id: group.spaceId,
+                                      position: { x: event.clientX, y: event.clientY },
+                                    });
+                                  }
+                                : undefined
                           }
                           aria-expanded={group.emptySpaceId ? undefined : !collapsed}
                           aria-label={
@@ -2708,7 +2825,7 @@ export function ShellPage() {
                               position: { x: event.clientX, y: event.clientY },
                             });
                           }}
-                          className={`flex w-full gap-3 rounded-xl px-2.5 py-[11px] text-start ${
+                          className={`flex w-full items-center gap-3 rounded-xl px-2.5 py-[10px] text-start ${
                             item.kind === "bot" ? "cursor-grab active:cursor-grabbing" : ""
                           } ${
                             (item.kind === "bot" && !inGroup && active?.id === item.chat.id) ||
@@ -2739,69 +2856,54 @@ export function ShellPage() {
                             />
                           )}
                           <div className="min-w-0 flex-1">
-                            <div className="flex items-baseline justify-between gap-2">
-                              <span
-                                dir="auto"
-                                data-roster-bot-name={item.kind === "bot" ? "" : undefined}
-                                className={`truncate text-[15px] text-foreground ${
-                                  item.chat.unread ? "font-semibold" : "font-medium"
-                                }`}
-                              >
-                                {item.chat.name}
+                            <div className="flex items-center justify-between gap-1.5">
+                              <div className="flex min-w-0 items-center gap-1.5 overflow-hidden">
+                                <span
+                                  dir="auto"
+                                  data-roster-bot-name={item.kind === "bot" ? "" : undefined}
+                                  className={`truncate text-[14px] text-foreground ${
+                                    item.chat.unread ? "font-semibold" : "font-medium"
+                                  }`}
+                                >
+                                  {item.chat.name}
+                                </span>
+                                {item.kind === "bot" && item.chat.title ? (
+                                  <span className="max-w-[130px] shrink-0 truncate rounded-md border border-border bg-muted px-2 py-0.5 text-[11px] font-normal text-muted-foreground">
+                                    {item.chat.title}
+                                  </span>
+                                ) : null}
                                 {item.chat.unread ? (
                                   <span className="sr-only">
                                     <Trans> (unread)</Trans>
                                   </span>
                                 ) : null}
-                              </span>
-                              <span className="flex shrink-0 items-center gap-1.5 text-[12.5px] text-muted-foreground/80">
-                                {item.kind === "bot" && item.chat.status !== "idle"
-                                  ? item.chat.status
-                                  : ""}
+                              </div>
+                              <div className="flex shrink-0 items-center gap-1.5">
+                                <span className="text-[11.5px] text-muted-foreground/60 tabular-nums">
+                                  {formatRosterTime(item.chat.updatedAt)}
+                                </span>
                                 {item.chat.unread ? (
                                   <span
                                     aria-hidden="true"
                                     className="inline-block h-2 w-2 rounded-full bg-foreground"
                                   />
                                 ) : null}
-                              </span>
-                            </div>
-                            {item.kind === "bot" && item.chat.title ? (
-                              <>
-                                <div
-                                  dir="auto"
-                                  className={`mt-0.5 truncate text-[13.5px] ${
-                                    item.chat.unread
-                                      ? "font-medium text-foreground/75"
-                                      : "text-muted-foreground"
-                                  }`}
-                                >
-                                  {item.chat.title}
-                                </div>
-                                {item.chat.preview ? (
-                                  <div
-                                    dir="auto"
-                                    className="truncate text-[12.5px] text-muted-foreground/80"
-                                  >
-                                    {item.chat.preview}
-                                  </div>
-                                ) : null}
-                              </>
-                            ) : (
-                              <div
-                                dir="auto"
-                                className={`mt-0.5 truncate text-[13.5px] ${
-                                  item.chat.unread
-                                    ? "font-medium text-foreground/75"
-                                    : "text-muted-foreground"
-                                }`}
-                              >
-                                {item.kind === "bot"
-                                  ? item.chat.preview
-                                  : item.chat.preview ||
-                                    item.chat.members.map((member) => member.name).join(", ")}
                               </div>
-                            )}
+                            </div>
+                            <div
+                              dir="auto"
+                              className={`mt-0.5 truncate text-[12.5px] ${
+                                item.chat.unread
+                                  ? "font-medium text-foreground/75"
+                                  : "text-muted-foreground/60"
+                              }`}
+                            >
+                              {item.kind === "bot"
+                                ? item.chat.preview ||
+                                  (item.chat.status !== "idle" ? item.chat.status : "")
+                                : item.chat.preview ||
+                                  item.chat.members.map((member) => member.name).join(", ")}
+                            </div>
                           </div>
                         </button>
                       ))}
@@ -2898,12 +3000,12 @@ export function ShellPage() {
         <button
           type="button"
           onClick={() => setPluginsOpen(true)}
-          className="mx-3 mb-1 flex items-center gap-3 rounded-[11px] px-2.5 py-2 hover:bg-sidebar-accent"
+          className="mx-3 mb-1 flex items-center gap-3 rounded-xl px-2.5 py-2 hover:bg-sidebar-accent"
         >
-          <span className="grid h-[30px] w-[30px] place-items-center rounded-full bg-muted text-foreground/75">
-            <Puzzle size={15} strokeWidth={1.7} />
+          <span className="grid h-[30px] w-[30px] place-items-center rounded-lg bg-accent text-foreground/80">
+            <LayoutGrid size={15} strokeWidth={1.8} />
           </span>
-          <span className="text-[14.5px] text-foreground/90">
+          <span className="text-[14px] font-medium text-foreground/90">
             <Trans>Integrations</Trans>
           </span>
         </button>
@@ -3019,6 +3121,8 @@ export function ShellPage() {
       >
         <div className="app-drag flex items-center justify-between border-b border-sidebar-border px-3 py-[17px] md:px-[22px]">
           <div className="flex min-w-0 items-center gap-2">
+            {/* Collapsed bots sidebar: this header is the leading edge for window chrome. */}
+            {botsSidebarCollapsed && desktopBridge() ? <WindowChrome /> : null}
             <button
               type="button"
               aria-label={t`Open navigation`}
@@ -3080,7 +3184,7 @@ export function ShellPage() {
                     void refreshThread(active.id).catch(() => undefined);
                   }
                 }}
-                data-active={panel ? "" : undefined}
+                data-active={panel === "computer" ? "" : undefined}
                 className="app-no-drag grid h-[30px] w-[34px] place-items-center rounded-[9px] hover:bg-accent data-active:bg-accent"
               >
                 <Monitor size={18} strokeWidth={1.6} className="text-foreground/75" />
@@ -3614,6 +3718,12 @@ export function ShellPage() {
               );
               setBotMenu(null);
             }}
+            onRenameSection={(sectionId) => {
+              const section = botSections.find((item) => item.id === sectionId);
+              const spaceId = bootstrapMe?.spaceId;
+              if (section && spaceId) setRenameSectionTarget({ section, spaceId });
+              setBotMenu(null);
+            }}
             onEdit={() => {
               navigate(contextBot ? `/app/${contextBot.id}` : `/app/g/${contextGroup!.id}`);
               setPanel(contextBot ? "settings" : "group-settings");
@@ -3759,6 +3869,64 @@ export function ShellPage() {
               await refreshBots();
             }}
           />
+        ) : null}
+
+        {renameSectionTarget ? (
+          <RenameBotSectionDialog
+            section={renameSectionTarget.section}
+            onCancel={() => setRenameSectionTarget(null)}
+            onConfirm={async (name) => {
+              await rpc.botSections.update(
+                {
+                  sectionId: renameSectionTarget.section.id,
+                  name,
+                },
+                { context: { spaceId: renameSectionTarget.spaceId } },
+              );
+              setRenameSectionTarget(null);
+              await refreshBots();
+            }}
+          />
+        ) : null}
+
+        {sectionMenu ? (
+          <DropdownMenu
+            open
+            onOpenChange={(open) => {
+              if (!open) closeSectionMenu();
+            }}
+          >
+            <DropdownMenuTrigger
+              render={
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  aria-hidden
+                  className="fixed size-0 p-0 opacity-0"
+                  style={{ left: sectionMenu.position.x, top: sectionMenu.position.y }}
+                />
+              }
+            />
+            <DropdownMenuContent
+              aria-label={t`Actions for ${sectionMenu.section.name}`}
+              align="start"
+              sideOffset={0}
+              className="w-[220px]"
+            >
+              <DropdownMenuItem
+                onClick={() => {
+                  setRenameSectionTarget({
+                    section: sectionMenu.section,
+                    spaceId: sectionMenu.spaceId,
+                  });
+                  setSectionMenu(null);
+                }}
+              >
+                <Pencil />
+                {t`Rename section`}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         ) : null}
 
         <CommandPalette
@@ -3927,143 +4095,150 @@ export function ShellPage() {
           </div>
         </div>
       ) : computerOpen && active ? (
-        <div className="absolute inset-0 z-30 flex flex-col bg-background">
+        <div className="fixed inset-0 z-30 bg-background">
           <div
-            data-testid="computer-chrome"
-            className="flex items-center justify-between gap-4 border-b border-sidebar-border px-[18px] py-3.5"
+            data-testid="computer-viewport"
+            className="fixed inset-x-0 top-0 flex flex-col bg-background"
+            style={{
+              height: computerViewport ? `${computerViewport.height}px` : "100dvh",
+              top: computerViewport ? `${computerViewport.offsetTop}px` : undefined,
+            }}
           >
-            <div className="flex min-w-0 flex-1 items-center gap-3">
-              <BotAvatar
-                color={active.color}
-                identity={active.id}
-                size={28}
-                status={active.status}
-              />
-              {recordingSkill ? (
-                <TeachRecordingChrome
-                  recording={recordingSkill}
-                  busy={teachBusy}
-                  onStop={stopTeaching}
-                  variant="overlay"
-                />
-              ) : (
-                <span className="truncate text-[15.5px] font-medium text-foreground" dir="auto">
-                  {computerLabel(computer?.mode, active.name)}
-                </span>
-              )}
-              {!recordingSkill && hasControl ? (
-                computer?.takeoverRequested ? (
-                  <span className="rounded-full bg-warning/15 px-[11px] py-1 text-[13px] text-warning">
-                    <Trans>Needs you</Trans>
-                  </span>
-                ) : (
-                  <span className="rounded-full bg-success/15 px-[11px] py-1 text-[13px] text-success">
-                    <Trans>You have control</Trans>
-                  </span>
-                )
-              ) : null}
-            </div>
-            <div className="flex items-center gap-3">
-              {composerRunning ? (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  aria-label={t`Stop`}
-                  data-testid="computer-overlay-stop"
-                  onClick={() => void stopRun()}
-                  disabled={sending}
-                >
-                  <Trans>Stop</Trans>
-                </Button>
-              ) : null}
-              {recordingSkill ? (
-                <TeachStopButton busy={teachBusy} onStop={stopTeaching} />
-              ) : hasControl ? (
-                <ComputerReleaseActions
-                  takeoverRequested={Boolean(computer?.takeoverRequested)}
-                  onRelease={releaseComputer}
-                />
-              ) : null}
-              {active && !recordingSkill ? (
-                <TeachComputerOverlayControl
-                  key={active.id}
-                  botId={active.id}
-                  computer={computer}
-                  busy={teachBusy}
-                  onRefresh={refreshActiveTeaching}
-                />
-              ) : null}
-              {active && !recordingSkill ? (
-                <ComputerMaintenanceActions
-                  botId={active.id}
-                  computer={computer}
-                  onChanged={async () => {
-                    await refreshThread(active.id);
-                  }}
-                />
-              ) : null}
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                className="text-muted-foreground"
-                aria-label={t`Close computer`}
-                onClick={() => setComputerOpen(false)}
-              >
-                <X size={16} strokeWidth={1.8} />
-              </Button>
-            </div>
-          </div>
-          {sendError ? (
             <div
-              role="alert"
-              className="border-b border-destructive/40 bg-destructive/10 px-[18px] py-2 text-[13px] text-destructive"
+              data-testid="computer-chrome"
+              className="flex items-center justify-between gap-4 border-b border-sidebar-border px-[18px] py-3.5"
             >
-              {sendError}
-            </div>
-          ) : null}
-          <div className="relative min-h-0 flex-1 bg-background">
-            {computer?.kind === "desktop" ? (
-              <DesktopKindEmptyState className="grid h-full place-items-center px-8 text-center text-sm text-muted-foreground/80" />
-            ) : computer?.state === "running" && embeddedScreenUrl && !computerScreenError ? (
-              <>
-                <iframe
-                  title={t`Bot screen`}
-                  src={embeddedScreenUrl}
-                  sandbox={screenIframeSandbox(embeddedScreenUrl)}
-                  className="h-full w-full border-0 bg-black"
-                  allow="clipboard-read; clipboard-write; fullscreen"
-                  style={{
-                    pointerEvents: recordingSkill || !hasControl ? "none" : "auto",
-                  }}
+              <div className="flex min-w-0 flex-1 items-center gap-3">
+                <BotAvatar
+                  color={active.color}
+                  identity={active.id}
+                  size={28}
+                  status={active.status}
                 />
-                {active ? (
-                  <TeachCaptureOverlay
-                    botId={active.id}
-                    skill={recordingSkill}
-                    enabled={Boolean(recordingSkill)}
-                    screenWidth={computer?.screenWidth}
-                    screenHeight={computer?.screenHeight}
+                {recordingSkill ? (
+                  <TeachRecordingChrome
+                    recording={recordingSkill}
+                    busy={teachBusy}
+                    onStop={stopTeaching}
+                    variant="overlay"
+                  />
+                ) : (
+                  <span className="truncate text-[15.5px] font-medium text-foreground" dir="auto">
+                    {computerLabel(computer?.mode, active.name)}
+                  </span>
+                )}
+                {!recordingSkill && hasControl ? (
+                  computer?.takeoverRequested ? (
+                    <span className="rounded-full bg-warning/15 px-[11px] py-1 text-[13px] text-warning">
+                      <Trans>Needs you</Trans>
+                    </span>
+                  ) : (
+                    <span className="rounded-full bg-success/15 px-[11px] py-1 text-[13px] text-success">
+                      <Trans>You have control</Trans>
+                    </span>
+                  )
+                ) : null}
+              </div>
+              <div className="flex items-center gap-3">
+                {composerRunning ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    aria-label={t`Stop`}
+                    data-testid="computer-overlay-stop"
+                    onClick={() => void stopRun()}
+                    disabled={sending}
+                  >
+                    <Trans>Stop</Trans>
+                  </Button>
+                ) : null}
+                {recordingSkill ? (
+                  <TeachStopButton busy={teachBusy} onStop={stopTeaching} />
+                ) : hasControl ? (
+                  <ComputerReleaseActions
+                    takeoverRequested={Boolean(computer?.takeoverRequested)}
+                    onRelease={releaseComputer}
                   />
                 ) : null}
-              </>
-            ) : (
-              <div className="grid h-full place-items-center text-sm text-muted-foreground/80">
-                {computerScreenError ??
-                  (computer?.state === "suspended"
-                    ? t`Computer is asleep`
-                    : computerLabel(computer?.mode, active.name))}
+                {active && !recordingSkill ? (
+                  <TeachComputerOverlayControl
+                    key={active.id}
+                    botId={active.id}
+                    computer={computer}
+                    busy={teachBusy}
+                    onRefresh={refreshActiveTeaching}
+                  />
+                ) : null}
+                {active && !recordingSkill ? (
+                  <ComputerMaintenanceActions
+                    botId={active.id}
+                    computer={computer}
+                    onChanged={async () => {
+                      await refreshThread(active.id);
+                    }}
+                  />
+                ) : null}
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  className="text-muted-foreground"
+                  aria-label={t`Close computer`}
+                  onClick={() => setComputerOpen(false)}
+                >
+                  <X size={16} strokeWidth={1.8} />
+                </Button>
               </div>
-            )}
+            </div>
+            {sendError ? (
+              <div
+                role="alert"
+                className="border-b border-destructive/40 bg-destructive/10 px-[18px] py-2 text-[13px] text-destructive"
+              >
+                {sendError}
+              </div>
+            ) : null}
+            <div className="relative min-h-0 flex-1 bg-background">
+              {computer?.kind === "desktop" ? (
+                <DesktopKindEmptyState className="grid h-full place-items-center px-8 text-center text-sm text-muted-foreground/80" />
+              ) : computer?.state === "running" && embeddedScreenUrl && !computerScreenError ? (
+                <>
+                  <iframe
+                    title={t`Bot screen`}
+                    src={embeddedScreenUrl}
+                    sandbox={screenIframeSandbox(embeddedScreenUrl)}
+                    className="h-full w-full border-0 bg-black"
+                    allow="clipboard-read; clipboard-write; fullscreen"
+                    style={{
+                      pointerEvents: recordingSkill || !hasControl ? "none" : "auto",
+                    }}
+                  />
+                  {active ? (
+                    <TeachCaptureOverlay
+                      botId={active.id}
+                      skill={recordingSkill}
+                      enabled={Boolean(recordingSkill)}
+                      screenWidth={computer?.screenWidth}
+                      screenHeight={computer?.screenHeight}
+                    />
+                  ) : null}
+                </>
+              ) : (
+                <div className="grid h-full place-items-center text-sm text-muted-foreground/80">
+                  {computerScreenError ??
+                    (computer?.state === "suspended"
+                      ? t`Computer is asleep`
+                      : computerLabel(computer?.mode, active.name))}
+                </div>
+              )}
+            </div>
           </div>
         </div>
       ) : null}
     </div>
   );
 
-  return (
-    <AvatarStyleProvider value={bootstrapMe?.avatarStyle ?? "robot"}>{shell}</AvatarStyleProvider>
-  );
+  return <AvatarStyleProvider value="organic">{shell}</AvatarStyleProvider>;
 }
 
 const Transcript = memo(function Transcript({
@@ -4859,7 +5034,7 @@ const Composer = memo(function Composer({
       ) : null}
       <div
         data-testid="composer-bar"
-        className="flex items-center gap-3.5 rounded-full border border-border bg-background py-[9px] pe-2.5 ps-3"
+        className="flex items-center gap-3.5 rounded-full border border-border bg-background py-[9px] pe-2.5 ps-3 transition-colors focus-within:border-ring"
       >
         <input
           ref={fileInputRef}
@@ -4870,14 +5045,14 @@ const Composer = memo(function Composer({
           onChange={(event) => void onAttachmentPick(event.target.files)}
         />
         <Button
-          variant="outline"
+          variant="ghost"
           size="icon"
           aria-label={t`Attach file`}
           disabled={disabled}
           onClick={() => fileInputRef.current?.click()}
-          className="rounded-full text-foreground/75"
+          className="size-8 shrink-0 rounded-full border border-border bg-muted text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
         >
-          <Plus size={17} strokeWidth={1.8} />
+          <Plus size={16} strokeWidth={2} />
         </Button>
         <div className="flex min-w-0 flex-1 flex-wrap items-end gap-1.5">
           {selectedSkill ? (
@@ -5001,21 +5176,21 @@ const Composer = memo(function Composer({
             title={t`Voice`}
             disabled={disabled}
             onClick={onVoice}
-            className="rounded-full text-foreground/75"
+            className="size-8 shrink-0 rounded-full text-foreground/75"
           >
             <Mic size={16} strokeWidth={1.8} />
           </Button>
         ) : null}
         {running ? (
-          <>
+          <div className="flex items-center gap-1.5 shrink-0">
             <Button
               size="icon"
               aria-label={t`Send`}
               disabled={sending || !canSend || disabled}
               onClick={send}
-              className="size-10 rounded-full"
+              className="size-8 rounded-full bg-white text-black hover:bg-white/90 shadow-sm transition-transform active:scale-95"
             >
-              <ArrowUp size={18} strokeWidth={2} />
+              <ArrowUp size={16} strokeWidth={2.2} />
             </Button>
             <Button
               variant="outline"
@@ -5023,20 +5198,20 @@ const Composer = memo(function Composer({
               aria-label={t`Stop`}
               disabled={sending}
               onClick={() => void onStop()}
-              className="size-10 rounded-full text-foreground/75"
+              className="size-8 rounded-full border border-border bg-muted text-foreground/80 shadow-sm transition-colors hover:bg-accent hover:text-foreground"
             >
-              <Square size={12} strokeWidth={0} fill="currentColor" />
+              <Square size={11} strokeWidth={0} fill="currentColor" />
             </Button>
-          </>
+          </div>
         ) : (
           <Button
             size="icon"
             aria-label={t`Send`}
             disabled={sending || !canSend || disabled}
             onClick={send}
-            className="size-9 rounded-full"
+            className="size-8 shrink-0 rounded-full bg-white text-black hover:bg-white/90 shadow-sm transition-transform active:scale-95 disabled:bg-white/10 disabled:text-muted-foreground/30 disabled:shadow-none"
           >
-            <ArrowUp size={18} strokeWidth={2} />
+            <ArrowUp size={16} strokeWidth={2.2} />
           </Button>
         )}
       </div>
@@ -5107,6 +5282,37 @@ function previewMessageText(message: ThreadMessage): string {
     return t`Attachment`;
   }
   return t`Message`;
+}
+
+function formatRosterTime(isoDate?: string | null): string {
+  if (!isoDate) return "";
+  try {
+    const d = new Date(isoDate);
+    if (Number.isNaN(d.getTime())) return "";
+    const locale = i18n.locale || "en";
+    const now = new Date();
+    const isToday =
+      d.getDate() === now.getDate() &&
+      d.getMonth() === now.getMonth() &&
+      d.getFullYear() === now.getFullYear();
+    if (isToday) {
+      return d.toLocaleTimeString(locale, { hour: "numeric", minute: "2-digit" });
+    }
+    const yesterday = new Date(now);
+    yesterday.setDate(now.getDate() - 1);
+    const isYesterday =
+      d.getDate() === yesterday.getDate() &&
+      d.getMonth() === yesterday.getMonth() &&
+      d.getFullYear() === yesterday.getFullYear();
+    if (isYesterday) return t`Yesterday`;
+    const diffDays = Math.floor((now.getTime() - d.getTime()) / (1000 * 60 * 60 * 24));
+    if (diffDays < 7) {
+      return d.toLocaleDateString(locale, { weekday: "short" });
+    }
+    return d.toLocaleDateString(locale, { month: "short", day: "numeric" });
+  } catch {
+    return "";
+  }
 }
 
 function MessageHoverActions({
@@ -5310,10 +5516,24 @@ const MessageView = memo(function MessageView({
   const isLive = message.id.startsWith("progress:");
   const visibleNarrationBlocks = message.blocks.filter((block) => !isToolActivityBlock(block));
   const parentJumpId = replyPreview?.id ?? replyToMessageId;
+  const speakerBot = message.botId ? peerBot?.(message.botId) : undefined;
+  const speakerColorDef = useMemo(
+    () => resolvePersonaColorDef(message.botId ?? "bot", speakerBot?.color),
+    [message.botId, speakerBot?.color],
+  );
   const messageContext = (
     <>
       {speakerName ? (
-        <div className="mb-1 text-[12.5px] font-medium text-muted-foreground" dir="auto">
+        <div
+          className="mb-1.5 flex items-center gap-2 text-[13px] font-semibold tracking-tight"
+          dir="auto"
+          style={{ color: speakerColorDef.light }}
+        >
+          <BotAvatar
+            color={speakerBot?.color ?? FALLBACK_BOT_COLOR}
+            identity={message.botId}
+            size={22}
+          />
           {speakerName}
         </div>
       ) : null}
